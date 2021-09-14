@@ -289,6 +289,8 @@ Checks that the digits of binary literals for the configured bases match their d
   * `bin` Default: `true` Checking binary 'b literals.
   * `oct` Default: `false` Checking octal 'o literals.
   * `hex` Default: `false` Checking hexadecimal 'h literals.
+  * `autofix` Default: `true` Provide autofix suggestions, e.g. 32'hAB provides suggested fix 32'h000000AB.
+  * `autofix_suggest_decimal_for_one` Default: `true` For the number 1 (one), provide two autofix alternatives e.g. 32'h1 provides suggestions 32'd1 and 32'h00000001.
 
 Enabled by default: true
 
@@ -315,4 +317,4 @@ Enabled by default: true
 
 ## Version
 
-Generated on 2021-09-10 12:35:20 -0700 from [9311fcd](https://github.com/google/verible/commit/9311fcd088e565d7a81015b621b772b080df195e)
+Generated on 2021-09-13 13:35:04 -0700 from [647386a](https://github.com/google/verible/commit/647386aaaaffed61b17510883fdf6a7205a620b0)
