@@ -33,6 +33,8 @@
 #define read(fd, buf, size) _read(fd, buf, size)
 #endif
 
+static constexpr size_t kBufferSize = 25 << 20;  // 25MiB for large files.
+
 using verible::lsp::BufferCollection;
 using verible::lsp::EditTextBuffer;
 using verible::lsp::InitializeResult;
@@ -41,7 +43,7 @@ using verible::lsp::MessageStreamSplitter;
 using verilog::VerilogAnalyzer;
 
 static std::string GetVersionNumber() {
-  return "0.0 alpha";   // TODO(hzeller): once ready, extract from build version
+  return "0.0 alpha";  // TODO(hzeller): once ready, extract from build version
 }
 
 // The "initialize" method requests server capabilities.
@@ -66,13 +68,13 @@ InitializeResult InitializeServer(const nlohmann::json &params) {
 }
 
 class VersionedAnalyzedBuffer {
-public:
+ public:
   VersionedAnalyzedBuffer(int64_t version, absl::string_view uri,
                           absl::string_view content)
-    : version_(version),
-      parser_(VerilogAnalyzer::AnalyzeAutomaticMode(content, uri)) {
-    std::cerr << "Analyzed " << uri << " lex:" <<
-      parser_->LexStatus() << "; parser:" << parser_->ParseStatus() << "\n";
+      : version_(version),
+        parser_(VerilogAnalyzer::AnalyzeAutomaticMode(content, uri)) {
+    std::cerr << "Analyzed " << uri << " lex:" << parser_->LexStatus()
+              << "; parser:" << parser_->ParseStatus() << "\n";
   }
 
   bool is_good() const {
@@ -80,9 +82,16 @@ public:
   }
 
   std::vector<verible::lsp::Diagnostic> GetDiagnostics() const {
+    // TODO: files that generate a lot of messages will create a huge
+    // output. So we limit the messages here.
+    // However, we should work towards emitting them around the last known
+    // edit point in the document as this is what the user sees.
+    static constexpr int kMaxMessages = 100;
     const auto &rejected_tokens = parser_->GetRejectedTokens();
     std::vector<verible::lsp::Diagnostic> result;
-    result.reserve(rejected_tokens.size());
+    int remaining =
+        std::min(kMaxMessages, static_cast<int>(rejected_tokens.size()));
+    result.reserve(remaining);
     for (const auto &rejected_token : rejected_tokens) {
       parser_->ExtractLinterTokenErrorDetail(
           rejected_token,
@@ -101,23 +110,23 @@ public:
                 .message = message,
             });
           });
+      if (--remaining <= 0) break;
     }
     return result;
   }
 
-private:
+ private:
   const int64_t version_;
   std::unique_ptr<VerilogAnalyzer> parser_;
 };
 
 class BufferTracker {
-public:
-  void Update(const std::string& filename,
-              const EditTextBuffer &txt) {
+ public:
+  void Update(const std::string &filename, const EditTextBuffer &txt) {
     // TODO: remove file:// prefix.
     txt.RequestContent([&txt, &filename, this](absl::string_view content) {
       current_ = std::make_shared<VersionedAnalyzedBuffer>(
-        txt.last_global_version(), filename, content);
+          txt.last_global_version(), filename, content);
     });
     if (current_->is_good()) {
       last_good_ = current_;
@@ -126,15 +135,15 @@ public:
 
   const VersionedAnalyzedBuffer *current() const { return current_.get(); }
 
-private:
+ private:
   std::shared_ptr<VersionedAnalyzedBuffer> current_;
   std::shared_ptr<VersionedAnalyzedBuffer> last_good_;
 };
 
 class ParsedBufferContainer {
-public:
+ public:
   BufferTracker *Update(const std::string &filename,
-              const EditTextBuffer &txt) {
+                        const EditTextBuffer &txt) {
     auto inserted = buffers_.insert({filename, nullptr});
     if (inserted.second) {
       inserted.first->second.reset(new BufferTracker());
@@ -143,7 +152,7 @@ public:
     return inserted.first->second.get();
   }
 
-private:
+ private:
   std::unordered_map<std::string, std::unique_ptr<BufferTracker>> buffers_;
 };
 
@@ -178,7 +187,7 @@ int main(int argc, char *argv[]) {
   // receive. It typically would be in the order of largest file to
   // be opened (as it is sent verbatim in didOpen).
   // Should be chosen accordingly.
-  MessageStreamSplitter stream_splitter(1 << 20);
+  MessageStreamSplitter stream_splitter(kBufferSize);
   JsonRpcDispatcher dispatcher(write_fun);
 
   // All bodies the stream splitter extracts are pushed to the json dispatcher
@@ -228,6 +237,9 @@ int main(int argc, char *argv[]) {
   }
 
   std::cerr << "Statistics" << std::endl;
+  std::cerr << "Largest message seen: "
+            << stream_splitter.StatLargestBodySeen() / 1024
+            << " kiB " << std::endl;
   for (const auto &stats : dispatcher.GetStatCounters()) {
     fprintf(stderr, "%30s %9d\n", stats.first.c_str(), stats.second);
   }
