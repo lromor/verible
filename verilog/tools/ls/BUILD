@@ -20,5 +20,6 @@ cc_binary(
       "//common/lsp:json-rpc-dispatcher",
       "//common/lsp:lsp-text-buffer",
       "//common/lsp:message-stream-splitter",
+      "//common/util:init_command_line",
     ],
 )

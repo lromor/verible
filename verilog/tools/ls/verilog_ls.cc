@@ -20,6 +20,7 @@
 #include "common/lsp/lsp-protocol.h"
 #include "common/lsp/lsp-text-buffer.h"
 #include "common/lsp/message-stream-splitter.h"
+#include "common/util/init_command_line.h"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -37,14 +38,18 @@ using verible::lsp::InitializeResult;
 using verible::lsp::JsonRpcDispatcher;
 using verible::lsp::MessageStreamSplitter;
 
+static std::string GetVersionNumber() {
+  return "0.0 alpha";   // TODO(hzeller): once ready, extract from build version
+}
+
 // The "initialize" method requests server capabilities.
 InitializeResult InitializeServer(const nlohmann::json &params) {
   // Ignore passed client capabilities from params right now,
   // just announce what we do.
   InitializeResult result;
   result.serverInfo = {
-      .name = "Verible testing language server.",
-      .version = "0.1",
+      .name = "Verible Verilog language server.",
+      .version = GetVersionNumber(),
   };
   result.capabilities = {
       {
@@ -59,11 +64,14 @@ InitializeResult InitializeServer(const nlohmann::json &params) {
 }
 
 int main(int argc, char *argv[]) {
+  const auto file_args = verible::InitCommandLine(argv[0], &argc, &argv);
+
 #ifdef _WIN32
   _setmode(_fileno(stdin), _O_BINARY);
 #endif
 
-  std::cerr << "Note: this dummy-ls is for testing." << std::endl;
+  std::cerr << "Verible Alpha Language Server " << GetVersionNumber()
+            << std::endl;
 
   // Input and output is stdin and stdout
   static constexpr int in_fd = 0;  // STDIN_FILENO
