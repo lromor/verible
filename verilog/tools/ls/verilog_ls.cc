@@ -21,6 +21,7 @@
 #include "common/lsp/lsp-text-buffer.h"
 #include "common/lsp/message-stream-splitter.h"
 #include "common/util/init_command_line.h"
+#include "verilog/analysis/verilog_analyzer.h"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -37,6 +38,7 @@ using verible::lsp::EditTextBuffer;
 using verible::lsp::InitializeResult;
 using verible::lsp::JsonRpcDispatcher;
 using verible::lsp::MessageStreamSplitter;
+using verilog::VerilogAnalyzer;
 
 static std::string GetVersionNumber() {
   return "0.0 alpha";   // TODO(hzeller): once ready, extract from build version
@@ -61,6 +63,94 @@ InitializeResult InitializeServer(const nlohmann::json &params) {
       },
   };
   return result;
+}
+
+class VersionedAnalyzedBuffer {
+public:
+  VersionedAnalyzedBuffer(int64_t version, absl::string_view uri,
+                          absl::string_view content)
+    : version_(version),
+      parser_(VerilogAnalyzer::AnalyzeAutomaticMode(content, uri)) {
+    std::cerr << "Analyzed " << uri << " lex:" <<
+      parser_->LexStatus() << "; parser:" << parser_->ParseStatus() << "\n";
+  }
+
+  bool is_good() const {
+    return parser_->LexStatus().ok() && parser_->ParseStatus().ok();
+  }
+
+  std::vector<verible::lsp::Diagnostic> GetDiagnostics() const {
+    const auto &rejected_tokens = parser_->GetRejectedTokens();
+    std::vector<verible::lsp::Diagnostic> result;
+    result.reserve(rejected_tokens.size());
+    for (const auto &rejected_token : rejected_tokens) {
+      parser_->ExtractLinterTokenErrorDetail(
+          rejected_token,
+          [&result](const std::string &filename, verible::LineColumnRange range,
+                    verible::AnalysisPhase phase, absl::string_view token_text,
+                    absl::string_view context_line, const std::string &msg) {
+            // Note: msg is currently empty and not useful.
+            result.emplace_back(verible::lsp::Diagnostic{
+                .range{.start{.line = range.start.line,
+                              .character = range.start.column},
+                       .end{.line = range.end.line,  //
+                            .character = range.end.column}},
+                .message = "syntax error",
+            });
+          });
+    }
+    return result;
+  }
+
+private:
+  const int64_t version_;
+  std::unique_ptr<VerilogAnalyzer> parser_;
+};
+
+class BufferTracker {
+public:
+  void Update(const std::string& filename,
+              const EditTextBuffer &txt) {
+    // TODO: remove file:// prefix.
+    txt.RequestContent([&txt, &filename, this](absl::string_view content) {
+      current_ = std::make_shared<VersionedAnalyzedBuffer>(
+        txt.last_global_version(), filename, content);
+    });
+    if (current_->is_good()) {
+      last_good_ = current_;
+    }
+  }
+
+  const VersionedAnalyzedBuffer *current() const { return current_.get(); }
+
+private:
+  std::shared_ptr<VersionedAnalyzedBuffer> current_;
+  std::shared_ptr<VersionedAnalyzedBuffer> last_good_;
+};
+
+class ParsedBufferContainer {
+public:
+  BufferTracker *Update(const std::string &filename,
+              const EditTextBuffer &txt) {
+    auto inserted = buffers_.insert({filename, nullptr});
+    if (inserted.second) {
+      inserted.first->second.reset(new BufferTracker());
+    }
+    inserted.first->second->Update(filename, txt);
+    return inserted.first->second.get();
+  }
+
+private:
+  std::unordered_map<std::string, std::unique_ptr<BufferTracker>> buffers_;
+};
+
+void ConsiderSendDiagnostics(const std::string &uri,
+                             const VersionedAnalyzedBuffer *buffer,
+                             JsonRpcDispatcher *dispatcher) {
+  verible::lsp::PublishDiagnosticsParams params;
+  params.uri = uri;
+  params.diagnostics = buffer->GetDiagnostics();
+  dispatcher->SendNotification("textDocument/publishDiagnostics", params);
 }
 
 int main(int argc, char *argv[]) {
@@ -97,6 +187,7 @@ int main(int argc, char *argv[]) {
   // The buffer collection keeps track of all the buffers opened in the editor.
   // It registers callbacks to receive the relevant events on the dispatcher.
   BufferCollection buffers(&dispatcher);
+  ParsedBufferContainer parsed_buffers;
 
   // Exchange of capabilities.
   dispatcher.AddRequestHandler("initialize", InitializeServer);
@@ -109,11 +200,22 @@ int main(int argc, char *argv[]) {
                                  return nullptr;
                                });
 
+  int64_t last_updated_version = 0;
   absl::Status status = absl::OkStatus();
   while (status.ok() && !shutdown_requested) {
     status = stream_splitter.PullFrom([](char *buf, int size) -> int {  //
       return read(in_fd, buf, size);
     });
+
+    // TODO: this should work async.
+    buffers.MapBuffersChangedSince(
+        last_updated_version,
+        [&parsed_buffers, &dispatcher](const std::string &uri,
+                                       const EditTextBuffer &txt) {
+          BufferTracker *const buffer = parsed_buffers.Update(uri, txt);
+          ConsiderSendDiagnostics(uri, buffer->current(), &dispatcher);
+        });
+    last_updated_version = buffers.global_version();
   }
 
   std::cerr << status.message() << std::endl;

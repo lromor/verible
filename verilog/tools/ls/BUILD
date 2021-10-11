@@ -21,5 +21,6 @@ cc_binary(
       "//common/lsp:lsp-text-buffer",
       "//common/lsp:message-stream-splitter",
       "//common/util:init_command_line",
+      "//verilog/analysis:verilog_analyzer",
     ],
 )
