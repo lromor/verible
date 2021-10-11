@@ -22,6 +22,8 @@
 #include "common/lsp/message-stream-splitter.h"
 #include "common/util/init_command_line.h"
 #include "verilog/analysis/verilog_analyzer.h"
+#include "verilog/analysis/verilog_linter.h"
+
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -74,8 +76,10 @@ class VersionedAnalyzedBuffer {
       : version_(version),
         parser_(VerilogAnalyzer::AnalyzeAutomaticMode(content, uri)) {
     std::cerr << "Analyzed " << uri << " lex:" << parser_->LexStatus()
-              << "; parser:" << parser_->ParseStatus() << "\n";
+              << "; parser:" << parser_->ParseStatus() << std::endl;
+    RunLinter(uri);  // TODO: we should use filename here
   }
+
 
   bool is_good() const {
     return parser_->LexStatus().ok() && parser_->ParseStatus().ok();
@@ -88,9 +92,10 @@ class VersionedAnalyzedBuffer {
     // edit point in the document as this is what the user sees.
     static constexpr int kMaxMessages = 100;
     const auto &rejected_tokens = parser_->GetRejectedTokens();
+    auto const &lint_violations = verilog::GetSortedViolations(lint_statuses_);
     std::vector<verible::lsp::Diagnostic> result;
-    int remaining =
-        std::min(kMaxMessages, static_cast<int>(rejected_tokens.size()));
+    int remaining = rejected_tokens.size() + lint_violations.size();
+    if (remaining > kMaxMessages) remaining = kMaxMessages;
     result.reserve(remaining);
     for (const auto &rejected_token : rejected_tokens) {
       parser_->ExtractLinterTokenErrorDetail(
@@ -112,12 +117,53 @@ class VersionedAnalyzedBuffer {
           });
       if (--remaining <= 0) break;
     }
+
+    const absl::string_view base = parser_->Data().Contents();
+    verible::LineColumnMap line_column_map(base);
+    for (const auto &v : lint_violations) {
+      const verible::LintViolation &violation = *v.violation;
+      verible::LineColumn start = line_column_map(violation.token.left(base));
+      verible::LineColumn end = line_column_map(violation.token.right(base));
+      result.emplace_back(verible::lsp::Diagnostic{
+          .range =
+              {
+                  .start = {.line = start.line, .character = start.column},
+                  .end = {.line = end.line, .character = end.column},
+              },
+          .message = absl::StrCat(violation.reason, " ", v.status->url, "[",
+                                  v.status->lint_rule_name, "]"),
+      });
+      --remaining;
+    }
     return result;
   }
 
  private:
+  void RunLinter(absl::string_view filename) {
+    const auto& text_structure = parser_->Data();
+    verilog::LinterConfiguration config;  // TODO: read from project context
+    verilog::RuleBundle bundle;
+    auto status = config.ConfigureFromOptions(verilog::LinterOptions{
+        .ruleset = verilog::RuleSet::kAll,
+        .rules = bundle,
+      });
+    if (!status.ok()) {
+      std::cerr << "Got an issue with the lint configuration" << std::endl;
+      return;
+    }
+    const bool show_context = true;  // ? needed
+    const auto linter_result =
+      VerilogLintTextStructure(filename, config, text_structure, show_context);
+    if (!linter_result.ok()) {
+      return;
+    }
+
+    lint_statuses_ = linter_result.value();
+  }
+
   const int64_t version_;
   std::unique_ptr<VerilogAnalyzer> parser_;
+  std::vector<verible::LintRuleStatus> lint_statuses_;
 };
 
 class BufferTracker {
