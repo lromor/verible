@@ -24,7 +24,6 @@
 #include "verilog/analysis/verilog_analyzer.h"
 #include "verilog/analysis/verilog_linter.h"
 
-
 #ifndef _WIN32
 #include <unistd.h>
 #else
@@ -65,8 +64,25 @@ InitializeResult InitializeServer(const nlohmann::json &params) {
               {"change", 2},        // Incremental updates
           },
       },
+      {"codeActionProvider", true},
   };
+
   return result;
+}
+
+bool operator<(const verible::lsp::Position &a,
+               const verible::lsp::Position &b) {
+  if (a.line > b.line) return false;
+  if (a.line < b.line) return true;
+  return a.character < b.character;
+}
+bool operator==(const verible::lsp::Position &a,
+                const verible::lsp::Position &b) {
+  return a.line == b.line && a.character == b.character;
+}
+bool rangeOverlap(const verible::lsp::Range &a, const verible::lsp::Range &b) {
+  return a.start == b.start || a.end == b.end ||
+         (a.start < b.end && b.start < a.end);
 }
 
 class VersionedAnalyzedBuffer {
@@ -79,7 +95,6 @@ class VersionedAnalyzedBuffer {
               << "; parser:" << parser_->ParseStatus() << std::endl;
     RunLinter(uri);  // TODO: we should use filename here
   }
-
 
   bool is_good() const {
     return parser_->LexStatus().ok() && parser_->ParseStatus().ok();
@@ -121,44 +136,110 @@ class VersionedAnalyzedBuffer {
     const absl::string_view base = parser_->Data().Contents();
     verible::LineColumnMap line_column_map(base);
     for (const auto &v : lint_violations) {
-      const verible::LintViolation &violation = *v.violation;
-      verible::LineColumn start = line_column_map(violation.token.left(base));
-      verible::LineColumn end = line_column_map(violation.token.right(base));
-      result.emplace_back(verible::lsp::Diagnostic{
-          .range =
-              {
-                  .start = {.line = start.line, .character = start.column},
-                  .end = {.line = end.line, .character = end.column},
-              },
-          .message = absl::StrCat(violation.reason, " ", v.status->url, "[",
-                                  v.status->lint_rule_name, "]"),
-      });
+      result.emplace_back(ViolationToDiagnostic(v, base, line_column_map));
       --remaining;
+    }
+    return result;
+  }
+
+  std::vector<verible::lsp::CodeAction> HandleCodeAction(
+      const verible::lsp::CodeActionParams &p) const {
+    auto const &lint_violations = verilog::GetSortedViolations(lint_statuses_);
+    if (lint_violations.empty()) return {};
+
+    const absl::string_view base = parser_->Data().Contents();
+    verible::LineColumnMap line_column_map(base);
+
+    std::vector<verible::lsp::CodeAction> result;
+    for (const auto &v : lint_violations) {
+      const verible::LintViolation &violation = *v.violation;
+      if (violation.autofixes.empty()) continue;
+      auto diagnostic = ViolationToDiagnostic(v, base, line_column_map);
+
+      // The editor usually has the cursor on a line or word, so we
+      // only want to output edits that are relevant.
+      if (!rangeOverlap(diagnostic.range, p.range)) continue;
+
+      bool preferred_fix = true;
+      for (const auto &fix : violation.autofixes) {
+        result.emplace_back(verible::lsp::CodeAction{
+            .title = fix.Description(),
+            .kind = "quickfix",
+            .diagnostics = {diagnostic},
+            .isPreferred = preferred_fix,
+            // The following is translated from json, map uri -> edits.
+            // We're only sending changes for one document, the current one.
+            .edit = {.changes = {{p.textDocument.uri,
+                                  AutofixToTextEdits(fix, base,
+                                                     line_column_map)}}},
+        });
+        preferred_fix = false;  // only the first is preferred.
+      }
     }
     return result;
   }
 
  private:
   void RunLinter(absl::string_view filename) {
-    const auto& text_structure = parser_->Data();
+    const auto &text_structure = parser_->Data();
     verilog::LinterConfiguration config;  // TODO: read from project context
     verilog::RuleBundle bundle;
     auto status = config.ConfigureFromOptions(verilog::LinterOptions{
         .ruleset = verilog::RuleSet::kAll,
         .rules = bundle,
-      });
+    });
     if (!status.ok()) {
       std::cerr << "Got an issue with the lint configuration" << std::endl;
       return;
     }
     const bool show_context = true;  // ? needed
-    const auto linter_result =
-      VerilogLintTextStructure(filename, config, text_structure, show_context);
+    const auto linter_result = VerilogLintTextStructure(
+        filename, config, text_structure, show_context);
     if (!linter_result.ok()) {
       return;
     }
 
     lint_statuses_ = linter_result.value();
+  }
+
+  // Convert our representation of a linter violation to a LSP-Diagnostic
+  static verible::lsp::Diagnostic ViolationToDiagnostic(
+      const verilog::LintViolationWithStatus &v, absl::string_view base,
+      const verible::LineColumnMap &lc_map) {
+    const verible::LintViolation &violation = *v.violation;
+    verible::LineColumn start = lc_map(violation.token.left(base));
+    verible::LineColumn end = lc_map(violation.token.right(base));
+    const char *fix_msg = violation.autofixes.empty() ? "" : " (fix available)";
+    return verible::lsp::Diagnostic{
+        .range =
+            {
+                .start = {.line = start.line, .character = start.column},
+                .end = {.line = end.line, .character = end.column},
+            },
+        .message = absl::StrCat(violation.reason, " ", v.status->url, "[",
+                                v.status->lint_rule_name, "]", fix_msg),
+    };
+  }
+
+  static std::vector<verible::lsp::TextEdit> AutofixToTextEdits(
+      const verible::AutoFix &fix, absl::string_view base,
+      const verible::LineColumnMap &lc_map) {
+    std::vector<verible::lsp::TextEdit> result;
+    // TODO(hzeller): figure out if edits are stacking or are all based
+    // on the same start status.
+    for (const verible::ReplacementEdit &edit : fix.Edits()) {
+      verible::LineColumn start = lc_map(edit.fragment.begin() - base.begin());
+      verible::LineColumn end = lc_map(edit.fragment.end() - base.begin());
+      result.emplace_back(verible::lsp::TextEdit{
+          .range =
+              {
+                  .start = {.line = start.line, .character = start.column},
+                  .end = {.line = end.line, .character = end.column},
+              },
+          .newText = edit.replacement,
+      });
+    }
+    return result;
   }
 
   const int64_t version_;
@@ -196,6 +277,15 @@ class ParsedBufferContainer {
     }
     inserted.first->second->Update(filename, txt);
     return inserted.first->second.get();
+  }
+
+  const VersionedAnalyzedBuffer *GetCurrent(const std::string &uri) {
+    auto found = buffers_.find(uri);
+    if (found == buffers_.end()) {
+      std::cerr << "Did not find " << uri << std::endl;
+      return nullptr;
+    }
+    return found->second->current();
   }
 
  private:
@@ -250,6 +340,15 @@ int main(int argc, char *argv[]) {
   // Exchange of capabilities.
   dispatcher.AddRequestHandler("initialize", InitializeServer);
 
+  dispatcher.AddRequestHandler(
+      "textDocument/codeAction",
+      [&parsed_buffers](const verible::lsp::CodeActionParams &p)
+          -> std::vector<verible::lsp::CodeAction> {
+        const auto analyzed = parsed_buffers.GetCurrent(p.textDocument.uri);
+        if (analyzed) return analyzed->HandleCodeAction(p);
+        return {};
+      });
+
   // The client sends a request to shut down. Use that to exit our loop.
   bool shutdown_requested = false;
   dispatcher.AddRequestHandler("shutdown",
@@ -284,8 +383,8 @@ int main(int argc, char *argv[]) {
 
   std::cerr << "Statistics" << std::endl;
   std::cerr << "Largest message seen: "
-            << stream_splitter.StatLargestBodySeen() / 1024
-            << " kiB " << std::endl;
+            << stream_splitter.StatLargestBodySeen() / 1024 << " kiB "
+            << std::endl;
   for (const auto &stats : dispatcher.GetStatCounters()) {
     fprintf(stderr, "%30s %9d\n", stats.first.c_str(), stats.second);
   }
