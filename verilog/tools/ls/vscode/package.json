@@ -11,6 +11,7 @@
     "engines": {
         "vscode": "^1.61.0"
     },
+    "icon": "images/icon.png",
     "contributes": {
         "languages": [{
             "id": "system-verilog",
